@@ -5,6 +5,7 @@ import websocket
 import json
 import pandas as pd
 import altair as alt
+import uuid
 from shared_data import trade_data
 
 # ✅ Pagina setup
@@ -13,17 +14,17 @@ st_autorefresh(interval=1000, key="refresh")
 
 st.title("📡 Bitvavo Live Trades")
 
-# Coin selectie
+# 🎯 Unieke sessie-ID (blijft geldig zolang tab open is)
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+my_id = st.session_state.session_id
+
+# Coin-selectie per gebruiker
 selected_pair = st.selectbox("Kies een coin:", ["BTC-EUR", "ETH-EUR", "SOL-EUR", "ADA-EUR", "XRP-EUR"])
 
-# ✅ WebSocket functie (bovenaan zetten!)
-def start_websocket(pair):
+# ✅ WebSocket functie
+def start_websocket(pair, session_id):
     def on_message(ws, message):
-        if not trade_data["is_streaming"]:
-            print("🛑 Streaming gestopt — WebSocket sluit")
-            ws.close()
-            return
-
         data = json.loads(message)
         if "event" in data and data["event"] == "trade":
             timestamp = pd.to_datetime(data["timestamp"], unit="ms")
@@ -32,33 +33,32 @@ def start_websocket(pair):
             side = data["side"]
 
             with trade_data["lock"]:
-                trade_data["trades"].insert(0, {
+                if session_id not in trade_data["sessions"]:
+                    trade_data["sessions"][session_id] = {"trades": [], "total": 0.0}
+
+                trades = trade_data["sessions"][session_id]["trades"]
+                trades.insert(0, {
                     "Time": timestamp,
                     "Price": price,
                     "Amount": amount,
                     "Side": side
                 })
-                trade_data["total"] += amount
-                if len(trade_data["trades"]) > 500:
-                    trade_data["trades"] = trade_data["trades"][:500]
+                trade_data["sessions"][session_id]["total"] += amount
+
+                if len(trades) > 500:
+                    trade_data["sessions"][session_id]["trades"] = trades[:500]
 
     def on_open(ws):
-        print("✅ WebSocket verbonden!")
         ws.send(json.dumps({
             "action": "subscribe",
             "channels": [{"name": "trades", "markets": [pair]}]
         }))
-        print(f"📡 Geabonneerd op: {pair}")
 
     ws = websocket.WebSocketApp(
         "wss://ws.bitvavo.com/v2/",
         on_open=on_open,
         on_message=on_message
     )
-
-    trade_data["ws_object"] = ws
-    trade_data["is_streaming"] = True
-
     ws.run_forever()
 
 # ✅ Start/Stop knoppen
@@ -66,34 +66,38 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("▶️ Start Streaming Trades"):
-        if not trade_data["is_streaming"]:
-            threading.Thread(target=lambda: start_websocket(selected_pair), daemon=True).start()
-            st.success(f"Streaming gestart voor {selected_pair}")
-        else:
-            st.info("WebSocket draait al")
+        with trade_data["lock"]:
+            if my_id not in trade_data["active_sessions"]:
+                if len(trade_data["active_sessions"]) < 3:
+                    trade_data["active_sessions"].add(my_id)
+                    trade_data["sessions"][my_id] = {"trades": [], "total": 0.0}
+                    st.session_state.streaming = True
+                    threading.Thread(target=lambda: start_websocket(selected_pair, my_id), daemon=True).start()
+                    st.success(f"Streaming gestart voor {selected_pair}")
+                else:
+                    st.error("❌ Maximum aantal actieve gebruikers bereikt.")
+            else:
+                st.info("Je bent al verbonden.")
 
 with col2:
     if st.button("⛔ Stop Streaming"):
-        if trade_data["is_streaming"]:
-            trade_data["is_streaming"] = False
-            with trade_data["lock"]:
-                trade_data["trades"] = []
-                trade_data["total"] = 0.0
-            st.warning("Streaming gestopt en trades gewist.")
+        with trade_data["lock"]:
+            trade_data["active_sessions"].discard(my_id)
+            trade_data["sessions"].pop(my_id, None)
+        st.session_state.streaming = False
+        st.warning("Streaming gestopt.")
 
-# ✅ Data ophalen
+# ✅ Data ophalen en tonen
 with trade_data["lock"]:
-    trades_copy = trade_data["trades"][:]
-    total_copy = trade_data["total"]
+    session_data = trade_data["sessions"].get(my_id, {"trades": [], "total": 0.0})
+    trades_copy = session_data["trades"][:]
+    total_copy = session_data["total"]
 
-st.markdown(f"**Totaal verhandeld volume:** {total_copy:.6f}")
-
-# ✅ Weergave
 if trades_copy:
     df = pd.DataFrame(trades_copy)
-    table_df = df.head(5)
+    st.markdown(f"**Totaal verhandeld volume:** {total_copy:.6f}")
     st.markdown("### Laatste 5 trades")
-    st.dataframe(table_df, use_container_width=True)
+    st.dataframe(df.head(5), use_container_width=True)
 
     # 📈 Prijs grafiek
     st.markdown("### 📈 Live koers en volume")
@@ -119,5 +123,7 @@ if trades_copy:
     combined = alt.vconcat(price_chart, volume_chart).resolve_scale(x="shared")
     st.altair_chart(combined, use_container_width=True)
 else:
-    st.info("Nog geen trades ontvangen...")
-
+    if st.session_state.get("streaming", False):
+        st.info("Trades worden geladen...")
+    else:
+        st.info("Nog geen trades ontvangen.")
