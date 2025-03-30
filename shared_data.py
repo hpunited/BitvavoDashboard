@@ -1,10 +1,11 @@
 import threading
 
-# Gedeelde data voor meerdere sessies
+# ✅ Gedeelde structuur voor trades en WebSocket controle
 trade_data = {
-    "sessions": {},  # Per sessie-ID: {"trades": [...], "total": float}
-    "active_sessions": set(),
-    "lock": threading.Lock()
+    "trades": [],
+    "total": 0.0,
+    "lock": threading.Lock(),
+    "ws_object": None,
+    "is_streaming": False
 }
-
 
